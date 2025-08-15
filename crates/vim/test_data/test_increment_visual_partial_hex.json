@@ -1,0 +1,16 @@
+{"Put":{"state":"0x1ˇ2ab"}}
+{"Key":"v"}
+{"Key":"l"}
+{"Key":"ctrl-a"}
+{"Get":{"state":"0x1ˇ3ab","mode":"Normal"}}
+{"Put":{"state":"0x1ˇ2ff"}}
+{"Key":"v"}
+{"Key":"l"}
+{"Key":"l"}
+{"Key":"ctrl-a"}
+{"Get":{"state":"0x1ˇ3ff","mode":"Normal"}}
+{"Put":{"state":"0x1ˇ2AB"}}
+{"Key":"v"}
+{"Key":"l"}
+{"Key":"ctrl-a"}
+{"Get":{"state":"0x1ˇ3AB","mode":"Normal"}}

@@ -4,6 +4,7 @@ use language::{Bias, Point};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::ops::Range;
+use text::Selection;
 
 use crate::{Vim, state::Mode};
 
@@ -71,7 +72,16 @@ impl Vim {
                         Point::new(row, 0)
                     };
 
-                    if let Some((range, num, radix)) = find_number(&snapshot, start) {
+                    if let Some((range, num, radix)) = if !selection.is_empty()
+                        && step == 0
+                        && matches!(vim.mode, Mode::Visual { .. } | Mode::VisualBlock { .. })
+                    {
+                        // For visual mode with no step, analyze only the selected text
+                        find_number_in_selection(&snapshot, selection.clone())
+                    } else {
+                        // For normal mode, step increment, or visual line mode, use standard number finding
+                        find_number(&snapshot, start)
+                    } {
                         let replace = match radix {
                             10 => increment_decimal_string(&num, delta),
                             16 => increment_hex_string(&num, delta),
@@ -160,6 +170,8 @@ fn increment_hex_string(num: &str, delta: i64) -> String {
     } else {
         u64::MAX
     };
+
+    // Preserve case but allow width expansion for overflow
     if should_use_lowercase(num) {
         format!("{:0width$x}", result, width = num.len())
     } else {
@@ -187,6 +199,84 @@ fn increment_binary_string(num: &str, delta: i64) -> String {
         u64::MAX
     };
     format!("{:0width$b}", result, width = num.len())
+}
+
+fn find_number_in_selection(
+    snapshot: &MultiBufferSnapshot,
+    selection: Selection<Point>,
+) -> Option<(Range<Point>, String, u32)> {
+    // Extract the selected text
+    let start_offset = selection.start.to_offset(snapshot);
+    let end_offset = selection.end.to_offset(snapshot);
+    let selected_text: String = snapshot
+        .chars_at(start_offset)
+        .take(end_offset - start_offset)
+        .collect();
+
+    if selected_text.is_empty() {
+        return None;
+    }
+
+    // Run number detection on the selected text as if it's a complete standalone string
+    let mut chars = selected_text.chars().peekable();
+    let mut num = String::new();
+    let mut radix = 10;
+    let mut found_digits = false;
+
+    // Check for hex or binary prefix
+    if selected_text.starts_with("0x") || selected_text.starts_with("0X") {
+        chars.next(); // consume '0'
+        chars.next(); // consume 'x'
+        radix = 16;
+    } else if selected_text.starts_with("0b") || selected_text.starts_with("0B") {
+        chars.next(); // consume '0'
+        chars.next(); // consume 'b'
+        radix = 2;
+    }
+
+    // Handle negative sign
+    if chars.peek() == Some(&'-') {
+        num.push(chars.next().unwrap());
+    }
+
+    // For visual selections without full prefix, only extract decimal digits
+    if radix == 10 {
+        // Collect only decimal digits, stopping at first non-digit
+        let decimal_start = selection.start.to_offset(snapshot);
+        let mut decimal_end = decimal_start;
+
+        while let Some(&ch) = chars.peek() {
+            if ch.is_digit(10) {
+                num.push(chars.next().unwrap());
+                found_digits = true;
+                decimal_end += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        // Adjust the range to only cover the decimal digits found
+        if found_digits && !num.is_empty() {
+            let decimal_end_point = decimal_end.to_point(snapshot);
+            return Some((selection.start..decimal_end_point, num, 10));
+        }
+    } else {
+        // For hex/binary with prefix, collect all valid digits
+        while let Some(&ch) = chars.peek() {
+            if ch.is_digit(radix) || (radix == 16 && ch.to_ascii_lowercase().is_ascii_hexdigit()) {
+                num.push(chars.next().unwrap());
+                found_digits = true;
+            } else {
+                break;
+            }
+        }
+    }
+
+    if found_digits && !num.is_empty() {
+        Some((selection.start..selection.end, num, radix))
+    } else {
+        None
+    }
 }
 
 fn find_number(
@@ -763,5 +853,87 @@ mod test {
         cx.set_state("let enabled = Onˇ;", Mode::Normal);
         cx.simulate_keystrokes("v b ctrl-a");
         cx.assert_state("let enabled = ˇOff;", Mode::Normal);
+    }
+
+    #[gpui::test]
+    async fn test_increment_visual_partial_number(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // Test selecting part of a decimal number
+        cx.simulate("v l ctrl-a", "12ˇ345").await.assert_matches();
+
+        // Test selecting beginning of a number
+        cx.simulate("v l ctrl-a", "ˇ12345").await.assert_matches();
+
+        // Test selecting end of a number
+        cx.simulate("v l ctrl-a", "123ˇ45").await.assert_matches();
+
+        // Test selecting middle digit
+        cx.simulate("v ctrl-a", "12ˇ345").await.assert_matches();
+
+        // Test decrement
+        cx.simulate("v l ctrl-x", "12ˇ345").await.assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_increment_visual_partial_hex(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // Test selecting part of a hex number
+        cx.simulate("v l ctrl-a", "0x1ˇ2ab").await.assert_matches();
+
+        // Test selecting hex digits that roll over
+        cx.simulate("v l l ctrl-a", "0x1ˇ2ff")
+            .await
+            .assert_matches();
+
+        // Test case preservation
+        cx.simulate("v l ctrl-a", "0x1ˇ2AB").await.assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_increment_visual_partial_binary(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // Test selecting part of a binary number
+        cx.simulate("v l ctrl-a", "0b1ˇ010").await.assert_matches();
+
+        // Test binary rollover
+        cx.simulate("v l l ctrl-a", "0b1ˇ111")
+            .await
+            .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_increment_visual_multiline_partial(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // Test visual line mode with partial numbers (should still work on complete numbers)
+        cx.simulate(
+            "shift-v j ctrl-a",
+            indoc! {"
+            value1 = 1ˇ234;
+            value2 = 5678;
+            value3 = 9012;
+        "},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_increment_visual_edge_cases(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // Test selecting across non-digit characters (should not increment)
+        cx.simulate("v l l ctrl-a", "12ˇ3.456")
+            .await
+            .assert_matches();
+
+        // Test selecting leading zeros
+        cx.simulate("v l ctrl-a", "00ˇ123").await.assert_matches();
+
+        // Test single digit at end of number
+        cx.simulate("v ctrl-a", "123ˇ4").await.assert_matches();
     }
 }

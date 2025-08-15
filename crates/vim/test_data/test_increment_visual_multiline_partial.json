@@ -1,0 +1,5 @@
+{"Put":{"state":"value1 = 1ˇ234;\nvalue2 = 5678;\nvalue3 = 9012;\n"}}
+{"Key":"shift-v"}
+{"Key":"j"}
+{"Key":"ctrl-a"}
+{"Get":{"state":"ˇvalue2 = 1234;\nvalue3 = 5678;\nvalue3 = 9012;\n","mode":"Normal"}}

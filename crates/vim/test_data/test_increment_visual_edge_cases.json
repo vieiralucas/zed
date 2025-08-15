@@ -1,0 +1,15 @@
+{"Put":{"state":"12ˇ3.456"}}
+{"Key":"v"}
+{"Key":"l"}
+{"Key":"l"}
+{"Key":"ctrl-a"}
+{"Get":{"state":"12ˇ4.456","mode":"Normal"}}
+{"Put":{"state":"00ˇ123"}}
+{"Key":"v"}
+{"Key":"l"}
+{"Key":"ctrl-a"}
+{"Get":{"state":"00ˇ133","mode":"Normal"}}
+{"Put":{"state":"123ˇ4"}}
+{"Key":"v"}
+{"Key":"ctrl-a"}
+{"Get":{"state":"123ˇ5","mode":"Normal"}}

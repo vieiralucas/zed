@@ -1,0 +1,11 @@
+{"Put":{"state":"0b1ˇ010"}}
+{"Key":"v"}
+{"Key":"l"}
+{"Key":"ctrl-a"}
+{"Get":{"state":"0b1ˇ020","mode":"Normal"}}
+{"Put":{"state":"0b1ˇ111"}}
+{"Key":"v"}
+{"Key":"l"}
+{"Key":"l"}
+{"Key":"ctrl-a"}
+{"Get":{"state":"0b1ˇ112","mode":"Normal"}}
