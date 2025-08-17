@@ -3,7 +3,8 @@ use gpui::{Action, Context, Window};
 use language::{Bias, Point};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::ops::Range;
+use std::slice::IterMut;
+use std::{f32::RADIX, ops::Range};
 use text::Selection;
 
 use crate::{Vim, state::Mode};
@@ -45,6 +46,115 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     });
 }
 
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Radix {
+    Dec,
+    Hex,
+    Bin,
+}
+
+impl From<Radix> for u32 {
+    fn from(radix: Radix) -> Self {
+        match radix {
+            Radix::Dec => 10,
+            Radix::Hex => 16,
+            Radix::Bin => 2,
+        }
+    }
+}
+
+enum BoolKind {
+    TrueFalse,
+    YesNo,
+    OnOff,
+}
+
+#[derive(Debug)]
+struct NumberIncrementTarget {
+    range: Range<Point>,
+    value: String,
+    radix: Radix,
+}
+
+impl NumberIncrementTarget {
+    fn increment(&mut self, delta: i64) {
+        match self.radix {
+            Radix::Dec => {
+                let mut value = self.value.parse::<u64>().unwrap();
+                value = (value as i64 + delta).abs() as u64;
+                self.value = format!("{}", value);
+            }
+            Radix::Hex => {
+                let mut value = self.value.parse::<u64>().unwrap();
+                value = (value as i64 + delta).abs() as u64;
+                self.value = format!("{:x}", value);
+            }
+            Radix::Bin => {
+                let mut value = self.value.parse::<u64>().unwrap();
+                value = (value as i64 + delta).abs() as u64;
+                self.value = format!("{:b}", value);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum IncrementTarget {
+    Number(NumberIncrementTarget),
+}
+
+impl IncrementTarget {
+    fn increment(&mut self, delta: i64) {
+        match self {
+            IncrementTarget::Number(target) => target.increment(delta),
+        }
+    }
+
+    fn as_edit(self) -> (Range<Point>, String) {
+        match self {
+            IncrementTarget::Number(target) => (target.range.clone(), target.value.clone()),
+        }
+    }
+}
+
+fn get_increment_targets(
+    snapshot: &MultiBufferSnapshot,
+    selections: Vec<Selection<Point>>,
+    is_visual: bool,
+) -> Vec<IncrementTarget> {
+    let mut targets = Vec::new();
+
+    for selection in &selections {
+        eprintln!("selection: {:?}", selection);
+
+        if is_visual {
+            if let Some(target) = find_number_in_selection(snapshot, selection) {
+                targets.push(IncrementTarget::Number(target));
+            }
+            continue;
+        }
+
+        for row in selection.start.row..=selection.end.row {
+            eprintln!("row: {:?}", row);
+
+            let start = if row == selection.start.row {
+                selection.start
+            } else {
+                Point::new(row, 0)
+            };
+            if let Some(target) = find_number(snapshot, start) {
+                targets.push(IncrementTarget::Number(target));
+            } else {
+                // TODO
+            }
+        }
+    }
+
+    eprintln!("targets: {:?}", targets);
+
+    targets
+}
+
 impl Vim {
     fn increment(
         &mut self,
@@ -55,76 +165,119 @@ impl Vim {
     ) {
         self.store_visual_marks(window, cx);
         self.update_editor(cx, |vim, editor, cx| {
-            let mut edits = Vec::new();
-            let mut new_anchors = Vec::new();
-
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            for selection in editor.selections.all_adjusted(cx) {
-                if !selection.is_empty()
-                    && (vim.mode != Mode::VisualBlock || new_anchors.is_empty())
-                {
-                    new_anchors.push((true, snapshot.anchor_before(selection.start)))
-                }
-                for row in selection.start.row..=selection.end.row {
-                    let start = if row == selection.start.row {
-                        selection.start
-                    } else {
-                        Point::new(row, 0)
-                    };
+            let selections = editor.selections.all_adjusted(cx);
 
-                    if let Some((range, num, radix)) = if !selection.is_empty()
-                        && step == 0
-                        && matches!(vim.mode, Mode::Visual { .. } | Mode::VisualBlock { .. })
-                    {
-                        // For visual mode with no step, analyze only the selected text
-                        find_number_in_selection(&snapshot, selection.clone())
-                    } else {
-                        // For normal mode, step increment, or visual line mode, use standard number finding
-                        find_number(&snapshot, start)
-                    } {
-                        let replace = match radix {
-                            10 => increment_decimal_string(&num, delta),
-                            16 => increment_hex_string(&num, delta),
-                            2 => increment_binary_string(&num, delta),
-                            _ => unreachable!(),
-                        };
-                        delta += step as i64;
-                        edits.push((range.clone(), replace));
-                        if selection.is_empty() {
-                            new_anchors.push((false, snapshot.anchor_after(range.end)))
-                        }
-                    } else if let Some((range, boolean)) = find_boolean(&snapshot, start) {
-                        let replace = toggle_boolean(&boolean);
-                        delta += step as i64;
-                        edits.push((range.clone(), replace));
-                        if selection.is_empty() {
-                            new_anchors.push((false, snapshot.anchor_after(range.end)))
-                        }
-                    } else if selection.is_empty() {
-                        new_anchors.push((true, snapshot.anchor_after(start)))
-                    }
-                }
+            let mut edits = vec![];
+            let mut new_anchors = vec![];
+            for mut target in get_increment_targets(
+                &snapshot,
+                selections,
+                // TODO: what about Mode::VisualLine ?
+                matches!(vim.mode, Mode::Visual | Mode::VisualBlock),
+            ) {
+                target.increment(delta);
+
+                let edit = target.as_edit();
+                let new_anchor = snapshot.anchor_after(edit.0.end);
+
+                new_anchors.push(new_anchor);
+                edits.push(edit);
+
+                delta += step as i64;
             }
+
             editor.transact(window, cx, |editor, window, cx| {
+                eprintln!("edits: {:?}", edits);
                 editor.edit(edits, cx);
 
-                let snapshot = editor.buffer().read(cx).snapshot(cx);
                 editor.change_selections(Default::default(), window, cx, |s| {
-                    let mut new_ranges = Vec::new();
-                    for (visual, anchor) in new_anchors.iter() {
+                    let ranges = new_anchors.iter().map(|anchor| {
                         let mut point = anchor.to_point(&snapshot);
-                        if !*visual && point.column > 0 {
-                            point.column -= 1;
-                            point = snapshot.clip_point(point, Bias::Left)
-                        }
-                        new_ranges.push(point..point);
-                    }
-                    s.select_ranges(new_ranges)
-                })
+                        point.column -= 1;
+                        let point = snapshot.clip_point(point, Bias::Left);
+                        point..point
+                    });
+                    s.select_ranges(ranges);
+                });
             });
         });
+
         self.switch_mode(Mode::Normal, true, window, cx)
     }
+
+    // self.store_visual_marks(window, cx);
+    // self.update_editor(cx, |vim, editor, cx| {
+    //     let mut edits = Vec::new();
+    //     let mut new_anchors = Vec::new();
+
+    //     let snapshot = editor.buffer().read(cx).snapshot(cx);
+    //     for selection in editor.selections.all_adjusted(cx) {
+    //         if !selection.is_empty()
+    //             && (vim.mode != Mode::VisualBlock || new_anchors.is_empty())
+    //         {
+    //             new_anchors.push((true, snapshot.anchor_before(selection.start)))
+    //         }
+    //         for row in selection.start.row..=selection.end.row {
+    //             let start = if row == selection.start.row {
+    //                 selection.start
+    //             } else {
+    //                 Point::new(row, 0)
+    //             };
+
+    //             if let Some((range, num, radix)) = if !selection.is_empty()
+    //                 && step == 0
+    //                 && matches!(vim.mode, Mode::Visual { .. } | Mode::VisualBlock { .. })
+    //             {
+    //                 // For visual mode with no step, analyze only the selected text
+    //                 find_number_in_selection(&snapshot, selection.clone())
+    //             } else {
+    //                 // For normal mode, step increment, or visual line mode, use standard number finding
+    //                 find_number(&snapshot, start)
+    //             } {
+    //                 let replace = match radix {
+    //                     10 => increment_decimal_string(&num, delta),
+    //                     16 => increment_hex_string(&num, delta),
+    //                     2 => increment_binary_string(&num, delta),
+    //                     _ => unreachable!(),
+    //                 };
+    //                 delta += step as i64;
+    //                 edits.push((range.clone(), replace));
+    //                 if selection.is_empty() {
+    //                     new_anchors.push((false, snapshot.anchor_after(range.end)))
+    //                 }
+    //             } else if let Some((range, boolean)) = find_boolean(&snapshot, start) {
+    //                 let replace = toggle_boolean(&boolean);
+    //                 delta += step as i64;
+    //                 edits.push((range.clone(), replace));
+    //                 if selection.is_empty() {
+    //                     new_anchors.push((false, snapshot.anchor_after(range.end)))
+    //                 }
+    //             } else if selection.is_empty() {
+    //                 new_anchors.push((true, snapshot.anchor_after(start)))
+    //             }
+    //         }
+    //     }
+    //     editor.transact(window, cx, |editor, window, cx| {
+    //         editor.edit(edits, cx);
+
+    //         let snapshot = editor.buffer().read(cx).snapshot(cx);
+    //         editor.change_selections(Default::default(), window, cx, |s| {
+    //             let mut new_ranges = Vec::new();
+    //             for (visual, anchor) in new_anchors.iter() {
+    //                 let mut point = anchor.to_point(&snapshot);
+    //                 if !*visual && point.column > 0 {
+    //                     point.column -= 1;
+    //                     point = snapshot.clip_point(point, Bias::Left)
+    //                 }
+    //                 new_ranges.push(point..point);
+    //             }
+    //             s.select_ranges(new_ranges)
+    //         })
+    //     });
+    // });
+    // self.switch_mode(Mode::Normal, true, window, cx)
+    // }
 }
 
 fn increment_decimal_string(num: &str, delta: i64) -> String {
@@ -203,8 +356,8 @@ fn increment_binary_string(num: &str, delta: i64) -> String {
 
 fn find_number_in_selection(
     snapshot: &MultiBufferSnapshot,
-    selection: Selection<Point>,
-) -> Option<(Range<Point>, String, u32)> {
+    selection: &Selection<Point>,
+) -> Option<NumberIncrementTarget> {
     // Extract the selected text
     let start_offset = selection.start.to_offset(snapshot);
     let end_offset = selection.end.to_offset(snapshot);
@@ -220,18 +373,18 @@ fn find_number_in_selection(
     // Run number detection on the selected text as if it's a complete standalone string
     let mut chars = selected_text.chars().peekable();
     let mut num = String::new();
-    let mut radix = 10;
+    let mut radix = Radix::Dec;
     let mut found_digits = false;
 
     // Check for hex or binary prefix
     if selected_text.starts_with("0x") || selected_text.starts_with("0X") {
         chars.next(); // consume '0'
         chars.next(); // consume 'x'
-        radix = 16;
+        radix = Radix::Hex;
     } else if selected_text.starts_with("0b") || selected_text.starts_with("0B") {
         chars.next(); // consume '0'
         chars.next(); // consume 'b'
-        radix = 2;
+        radix = Radix::Bin;
     }
 
     // Handle negative sign
@@ -240,49 +393,59 @@ fn find_number_in_selection(
     }
 
     // For visual selections without full prefix, only extract decimal digits
-    if radix == 10 {
-        // Collect only decimal digits, stopping at first non-digit
-        let decimal_start = selection.start.to_offset(snapshot);
-        let mut decimal_end = decimal_start;
+    match radix {
+        Radix::Dec => {
+            // Collect only decimal digits, stopping at first non-digit
+            let decimal_start = selection.start.to_offset(snapshot);
+            let mut decimal_end = decimal_start;
 
-        while let Some(&ch) = chars.peek() {
-            if ch.is_digit(10) {
-                num.push(chars.next().unwrap());
-                found_digits = true;
-                decimal_end += ch.len_utf8();
-            } else {
-                break;
+            while let Some(&ch) = chars.peek() {
+                if ch.is_digit(10) {
+                    num.push(chars.next().unwrap());
+                    found_digits = true;
+                    decimal_end += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+
+            // Adjust the range to only cover the decimal digits found
+            if found_digits && !num.is_empty() {
+                let decimal_end_point = decimal_end.to_point(snapshot);
+                return Some(NumberIncrementTarget {
+                    range: selection.start..decimal_end_point,
+                    value: num,
+                    radix: Radix::Dec,
+                });
             }
         }
-
-        // Adjust the range to only cover the decimal digits found
-        if found_digits && !num.is_empty() {
-            let decimal_end_point = decimal_end.to_point(snapshot);
-            return Some((selection.start..decimal_end_point, num, 10));
-        }
-    } else {
-        // For hex/binary with prefix, collect all valid digits
-        while let Some(&ch) = chars.peek() {
-            if ch.is_digit(radix) || (radix == 16 && ch.to_ascii_lowercase().is_ascii_hexdigit()) {
-                num.push(chars.next().unwrap());
-                found_digits = true;
-            } else {
-                break;
+        Radix::Hex | Radix::Bin => {
+            // For hex/binary with prefix, collect all valid digits
+            while let Some(&ch) = chars.peek() {
+                if ch.is_digit(radix.into())
+                    || (radix == Radix::Hex && ch.to_ascii_lowercase().is_ascii_hexdigit())
+                {
+                    num.push(chars.next().unwrap());
+                    found_digits = true;
+                } else {
+                    break;
+                }
             }
         }
     }
 
     if found_digits && !num.is_empty() {
-        Some((selection.start..selection.end, num, radix))
+        Some(NumberIncrementTarget {
+            range: selection.start..selection.end,
+            value: num,
+            radix: radix,
+        })
     } else {
         None
     }
 }
 
-fn find_number(
-    snapshot: &MultiBufferSnapshot,
-    start: Point,
-) -> Option<(Range<Point>, String, u32)> {
+fn find_number(snapshot: &MultiBufferSnapshot, start: Point) -> Option<NumberIncrementTarget> {
     let mut offset = start.to_offset(snapshot);
 
     let ch0 = snapshot.chars_at(offset).next();
@@ -300,13 +463,13 @@ fn find_number(
     let mut begin = None;
     let mut end = None;
     let mut num = String::new();
-    let mut radix = 10;
+    let mut radix = Radix::Dec;
 
     let mut chars = snapshot.chars_at(offset).peekable();
     // find the next number on the line (may start after the original cursor position)
     while let Some(ch) = chars.next() {
         if num == "0" && ch == 'b' && chars.peek().is_some() && chars.peek().unwrap().is_digit(2) {
-            radix = 2;
+            radix = Radix::Bin;
             begin = None;
             num = String::new();
         }
@@ -315,16 +478,16 @@ fn find_number(
             && chars.peek().is_some()
             && chars.peek().unwrap().is_ascii_hexdigit()
         {
-            radix = 16;
+            radix = Radix::Hex;
             begin = None;
             num = String::new();
         }
 
-        if ch.is_digit(radix)
+        if ch.is_digit(radix.into())
             || (begin.is_none()
                 && ch == '-'
                 && chars.peek().is_some()
-                && chars.peek().unwrap().is_digit(radix))
+                && chars.peek().unwrap().is_digit(radix.into()))
         {
             if begin.is_none() {
                 begin = Some(offset);
@@ -340,7 +503,11 @@ fn find_number(
     }
     if let Some(begin) = begin {
         let end = end.unwrap_or(offset);
-        Some((begin.to_point(snapshot)..end.to_point(snapshot), num, radix))
+        Some(NumberIncrementTarget {
+            range: begin.to_point(snapshot)..end.to_point(snapshot),
+            value: num,
+            radix,
+        })
     } else {
         None
     }
@@ -444,6 +611,22 @@ mod test {
         state::Mode,
         test::{NeovimBackedTestContext, VimTestContext},
     };
+
+    #[gpui::test]
+    async fn test_vsf_vsf(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {"
+            1ˇ2
+            "})
+            .await;
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+
+        cx.shared_state().await.assert_eq(indoc! {"
+            1ˇ3
+            "});
+    }
 
     #[gpui::test]
     async fn test_increment(cx: &mut gpui::TestAppContext) {
